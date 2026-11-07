@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+.local/
+*.private.json
+.clasp.json
+*.log
