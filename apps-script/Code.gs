@@ -17,13 +17,15 @@ function json_(data) {
   return ContentService.createTextOutput(JSON.stringify(data)).setMimeType(ContentService.MimeType.JSON);
 }
 
-function doGet() {
-  return json_(response_('unauthorized'));
+function doGet(e) {
+  // Callback records a code; only the originating setup browser can redeem it.
+  try { receiveCallback_(e && e.parameters); } catch (_) { /* No credential logging. */ }
+  return HtmlService.createHtmlOutput('<!doctype html><meta name="referrer" content="no-referrer"><p>Quay lại trang thiết lập để xem kết quả. Có thể đóng tab này.</p>');
 }
 
 function doPost(e) {
   try {
-    if (!e || !e.postData || e.postData.length > 1024 ||
+    if (!e || !e.postData || e.postData.length > 4096 ||
         !/^application\/x-www-form-urlencoded(?:;|$)/i.test(e.postData.type || '') ||
         !e.parameters || !e.parameters.key || e.parameters.key.length !== 1) {
       return json_(response_('unauthorized'));
@@ -32,6 +34,11 @@ function doPost(e) {
     if (typeof key !== 'string' || !/^[a-f0-9]{64}$/.test(key)) return json_(response_('unauthorized'));
     const store = PropertiesService.getScriptProperties();
     const props = store.getProperties();
+    if (e.parameters.action) {
+      if (e.parameters.action.length !== 1 || !/^[a-f0-9]{64}$/.test(props.OWNER_SETUP_HASH || '') ||
+          !equalHash_(sha256_(key), props.OWNER_SETUP_HASH)) return json_(response_('unauthorized'));
+      return json_(ownerAction_(e.parameters, store));
+    }
     const keyId = authenticate_(key, props);
     if (!keyId) return json_(response_('unauthorized'));
     const blocked = reserveCheck_(store, keyId, Date.now(), props['ACCESS_KEY_' + keyId]);
@@ -39,10 +46,11 @@ function doPost(e) {
     if (e.parameters.probe && e.parameters.probe.length === 1 && e.parameters.probe[0] === '1') {
       return json_(response_('not_found'));
     }
-    return json_(checkMailbox_(readConfig_(props), Date.now()));
+    if (!props.MAILBOX_REFRESH_TOKEN) return json_(response_('not_connected'));
+    return json_(checkMailbox_(readConfig_(props), Date.now(), mailboxToken_(props)));
   } catch (_) {
     // Never log exceptions: Gmail errors can contain message data or credentials.
-    return json_(response_('error'));
+    return json_(response_(_.message === 'NOT_CONNECTED' ? 'not_connected' : 'error'));
   }
 }
 
@@ -52,9 +60,13 @@ function equalHash_(left, right) {
   return difference === 0;
 }
 
-function authenticate_(key, props) {
-  const hash = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, key, Utilities.Charset.UTF_8)
+function sha256_(key) {
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, key, Utilities.Charset.UTF_8)
     .map(function (byte) { return ('0' + (byte & 255).toString(16)).slice(-2); }).join('');
+}
+
+function authenticate_(key, props) {
+  const hash = sha256_(key);
   const names = Object.keys(props).filter(function (name) { return /^ACCESS_KEY_[a-z0-9_-]{1,32}$/.test(name); });
   if (names.length > 10) throw new Error('KEY_CONFIGURATION');
   let match = null;
@@ -104,12 +116,12 @@ function reserveCheck_(store, keyId, now, expectedEntry) {
 }
 
 function readConfig_(props) {
-  if (!/^Label_[A-Za-z0-9_-]+$/.test(props.NETFLIX_LABEL_ID || '')) throw new Error('LABEL_CONFIGURATION');
-  const senders = JSON.parse(props.NETFLIX_SENDERS || 'null');
-  if (!Array.isArray(senders) || !senders.length || senders.length > 10 || senders.some(function (sender) {
+  if (props.NETFLIX_LABEL_ID && !/^Label_[A-Za-z0-9_-]+$/.test(props.NETFLIX_LABEL_ID)) throw new Error('LABEL_CONFIGURATION');
+  const senders = JSON.parse(props.NETFLIX_SENDERS || '[]');
+  if (!Array.isArray(senders) || senders.length > 10 || senders.some(function (sender) {
     return typeof sender !== 'string' || !/^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@(?:[a-z0-9-]+\.)*netflix\.com$/.test(sender);
   })) throw new Error('SENDER_CONFIGURATION');
-  return { labelId: props.NETFLIX_LABEL_ID, senders: senders };
+  return { labelId: props.NETFLIX_LABEL_ID || '', senders: senders };
 }
 
 function senderAddress_(headers) {
@@ -121,24 +133,45 @@ function senderAddress_(headers) {
   return /^[^\s<>@]+@[^\s<>@]+$/.test(address) ? address : '';
 }
 
-function checkMailbox_(config, now) {
-  const query = 'after:' + (Math.floor((now - WINDOW_MS) / 1000) - 1) + ' {' + config.senders.map(function (sender) {
+function eligible_(config, headers) {
+  const sender = senderAddress_(headers);
+  if (!/^[^\s<>@]+@(?:[a-z0-9-]+\.)*netflix\.com$/.test(sender) ||
+      (config.senders.length && config.senders.indexOf(sender) === -1)) return false;
+  if (config.labelId) return true;
+  const subjects = (headers || []).filter(function (h) { return h.name.toLowerCase() === 'subject'; });
+  if (subjects.length !== 1) return false;
+  const subject = subjects[0].value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[đĐ]/g, 'd').toLowerCase();
+  return /\b(?:sign[ -]?in|log[ -]?in|verification|temporary access|access|security|authentication) (?:code|passcode)\b|\bnetflix code\b|\bma (?:dang nhap|xac minh|xac thuc|truy cap|bao mat)\b/.test(subject);
+}
+
+function gmailGet_(path, parameters, token) {
+  const query = Object.keys(parameters).reduce(function (all, name) {
+    return all.concat((Array.isArray(parameters[name]) ? parameters[name] : [parameters[name]]).map(function (value) {
+      return encodeURIComponent(name) + '=' + encodeURIComponent(value);
+    }));
+  }, []).join('&');
+  return googleJson_('https://gmail.googleapis.com/gmail/v1/users/me/messages' + path + '?' + query,
+    { headers: { Authorization: 'Bearer ' + token } });
+}
+
+function checkMailbox_(config, now, token) {
+  const query = 'after:' + (Math.floor((now - WINDOW_MS) / 1000) - 1) + ' ' + (config.senders.length ? '{' + config.senders.map(function (sender) {
     return 'from:' + sender;
-  }).join(' ') + '}';
-  const list = Gmail.Users.Messages.list('me', {
-    labelIds: [config.labelId], q: query, maxResults: MAX_MESSAGES, includeSpamTrash: false,
-  });
+  }).join(' ') + '}' : 'from:(netflix.com)');
+  const parameters = { q: query, maxResults: MAX_MESSAGES, includeSpamTrash: false };
+  if (config.labelId) parameters.labelIds = [config.labelId];
+  const list = gmailGet_('', parameters, token);
   // ponytail: 50 candidates/check; fail closed on overflow, paginate if real volume requires it.
   if (list.nextPageToken) throw new Error('TOO_MANY_MESSAGES');
   let newest = null;
   let sameTime = false;
   (list.messages || []).forEach(function (item) {
-    const message = Gmail.Users.Messages.get('me', item.id, {
-      format: 'metadata', metadataHeaders: ['From'], fields: 'id,internalDate,payload/headers',
-    });
+    const message = gmailGet_('/' + encodeURIComponent(item.id), {
+      format: 'metadata', metadataHeaders: ['From', 'Subject'], fields: 'id,internalDate,payload/headers',
+    }, token);
     const received = Number(message.internalDate);
     if (!Number.isFinite(received) || received > now || now - received >= WINDOW_MS ||
-        config.senders.indexOf(senderAddress_(message.payload && message.payload.headers)) === -1) return;
+        !eligible_(config, message.payload && message.payload.headers)) return;
     if (!newest || received > newest.received) {
       newest = { id: item.id, received: received };
       sameTime = false;
@@ -146,9 +179,9 @@ function checkMailbox_(config, now) {
   });
   if (!newest) return response_('not_found');
   if (sameTime) return response_('unreadable');
-  const message = Gmail.Users.Messages.get('me', newest.id, { format: 'full', fields: 'internalDate,payload' });
+  const message = gmailGet_('/' + encodeURIComponent(newest.id), { format: 'full', fields: 'internalDate,payload' }, token);
   if (Number(message.internalDate) !== newest.received ||
-      config.senders.indexOf(senderAddress_(message.payload && message.payload.headers)) === -1) {
+      !eligible_(config, message.payload && message.payload.headers)) {
     return response_('unreadable');
   }
   const code = extractCode_(message.payload);
@@ -225,17 +258,4 @@ function extractCode_(payload) {
   if (plainCodes.length > 1 || htmlCodes.length > 1 ||
       (plainCodes.length && htmlCodes.length && plainCodes[0] !== htmlCodes[0])) return null;
   return plainCodes[0] || htmlCodes[0] || null;
-}
-
-function authorizeOwner() {
-  // Run once in the Apps Script editor as the mailbox owner. Logs no mailbox data.
-  Gmail.Users.Labels.list('me');
-}
-
-function configureNetflixLabel() {
-  const labels = (Gmail.Users.Labels.list('me').labels || []).filter(function (label) {
-    return label.name === 'NetflixVerification';
-  });
-  if (labels.length !== 1) throw new Error('Create the Gmail label NetflixVerification first.');
-  PropertiesService.getScriptProperties().setProperty('NETFLIX_LABEL_ID', labels[0].id);
 }

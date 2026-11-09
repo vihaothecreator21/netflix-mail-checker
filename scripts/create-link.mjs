@@ -15,14 +15,16 @@ try {
   if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) throw new Error('URL');
   const key = randomBytes(32).toString('hex');
   const hash = createHash('sha256').update(key).digest('hex');
-  url.hash = new URLSearchParams({ key }).toString();
+  const owner = name === 'owner';
+  if (owner) url.searchParams.set('setup', '1');
+  url.hash = new URLSearchParams({ [owner ? 'setup' : 'key']: key }).toString();
   const directory = join(tmpdir(), 'netflix-code-checker');
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const path = join(directory, `${name}-${randomBytes(6).toString('hex')}.private.json`);
   await writeFile(path, JSON.stringify({
     privateLink: url.href,
-    propertyName: `ACCESS_KEY_${name}`,
-    propertyValue: JSON.stringify({ hash, enabled: true }),
+    propertyName: owner ? 'OWNER_SETUP_HASH' : `ACCESS_KEY_${name}`,
+    propertyValue: owner ? hash : JSON.stringify({ hash, enabled: true }),
   }, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
   console.log(`Đã tạo file riêng: ${path}`);
   console.log('Chỉ gửi privateLink cho người nhận. Thêm propertyName/propertyValue vào Script Properties.');

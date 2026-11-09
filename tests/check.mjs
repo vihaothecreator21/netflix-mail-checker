@@ -7,7 +7,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import vm from 'node:vm';
 import { consumeKey, validateResponse, validEndpoint, checkCode, WINDOW_MS } from '../src/api.js';
 
-const source = readFileSync(new URL('../apps-script/Code.gs', import.meta.url), 'utf8');
+const source = ['Code.gs', 'OAuth.gs'].map((file) => readFileSync(new URL(`../apps-script/${file}`, import.meta.url), 'utf8')).join('\n');
 const NOW = Date.parse('2026-11-07T08:00:00.000Z');
 const KEY = 'a'.repeat(64); // Synthetic fixture, never a deployed credential.
 const hash = (key) => createHash('sha256').update(key).digest('hex');
@@ -15,7 +15,7 @@ const entry = (key = KEY) => JSON.stringify({ hash: hash(key), enabled: true });
 const part = (text, mimeType = 'text/plain') => ({ mimeType, body: { data: Buffer.from(text).toString('base64url') } });
 const mail = (id, text, age = 60000, mimeType = 'text/plain', sender = 'info@account.netflix.com') => ({
   id, internalDate: String(NOW - age),
-  payload: { ...part(text, mimeType), headers: [{ name: 'From', value: `Netflix <${sender}>` }] },
+  payload: { ...part(text, mimeType), headers: [{ name: 'From', value: `Netflix <${sender}>` }, { name: 'Subject', value: 'Your Netflix sign-in code' }] },
 });
 
 function harness(messages = [], overrides = {}) {
@@ -24,16 +24,24 @@ function harness(messages = [], overrides = {}) {
   let onWrite = null;
   let onLock = null;
   let listResult = null;
+  let exchange = null;
+  let refreshError = false;
   const calls = [];
   const props = {
     NETFLIX_LABEL_ID: 'Label_123',
     NETFLIX_SENDERS: '["info@account.netflix.com"]',
     ACCESS_KEY_family: entry(),
+    OWNER_SETUP_HASH: hash('c'.repeat(64)),
+    OAUTH_CLIENT_ID: 'test.apps.googleusercontent.com', OAUTH_CLIENT_SECRET: 'synthetic-secret',
+    BACKEND_URL: 'https://script.google.com/macros/s/test/exec',
+    MAILBOX_REFRESH_TOKEN: 'synthetic-refresh', MAILBOX_CONNECTED: 'true',
     ...overrides,
   };
   const store = {
     getProperties: () => ({ ...props }),
     getProperty: (name) => props[name] ?? null,
+    setProperty: (name, value) => { props[name] = value; },
+    deleteProperty: (name) => { delete props[name]; },
     setProperties: (updates) => { Object.assign(props, updates); if (onWrite) { const hook = onWrite; onWrite = null; hook(); } },
   };
   class Clock extends Date {
@@ -56,23 +64,41 @@ function harness(messages = [], overrides = {}) {
       MimeType: { JSON: 'application/json' },
       createTextOutput: (content) => ({ content, setMimeType() { return this; } }),
     },
+    HtmlService: { createHtmlOutput: (content) => ({ content }) },
     Utilities: {
       DigestAlgorithm: { SHA_256: 'sha256' }, Charset: { UTF_8: 'utf8' },
       computeDigest: (_, value) => [...createHash('sha256').update(value).digest()].map((b) => b > 127 ? b - 256 : b),
       base64DecodeWebSafe: (data) => Buffer.from(data, 'base64url'),
+      base64EncodeWebSafe: (data) => Buffer.from(data).toString('base64url'),
       newBlob: (data) => ({ getDataAsString: () => Buffer.from(data).toString('utf8') }),
     },
-    Gmail: { Users: { Messages: {
-      list: (_, options) => { calls.push({ kind: 'list', options }); return listResult || { messages: messages.map(({ id }) => ({ id })) }; },
-      get: (_, id, options) => {
+    UrlFetchApp: { fetch: (url, requestOptions) => {
+      let result;
+      let status = 200;
+      if (url === 'https://oauth2.googleapis.com/token') {
+        if (requestOptions.payload.grant_type === 'refresh_token') {
+          result = refreshError ? { error: 'invalid_grant' } : { access_token: 'synthetic-access' };
+          if (refreshError) status = 400;
+        } else result = exchange;
+      } else {
+        assert.equal(requestOptions.headers.Authorization, 'Bearer synthetic-access');
+        assert.equal(requestOptions.followRedirects, false);
+        const address = new URL(url);
+        const id = decodeURIComponent(address.pathname.split('/messages')[1].slice(1));
+        const options = Object.fromEntries(address.searchParams);
+        options.labelIds = address.searchParams.getAll('labelIds');
+        if (!id) { calls.push({ kind: 'list', options }); result = listResult || { messages: messages.map(({ id }) => ({ id })) }; }
+        else {
         calls.push({ kind: options.format, id });
         const message = messages.find((item) => item.id === id);
         if (!message) throw new Error('PRIVATE_MAILBOX_ERROR');
-        return options.format === 'metadata'
+        result = options.format === 'metadata'
           ? { id, internalDate: message.internalDate, payload: { headers: message.payload.headers } }
           : message;
-      },
-    }, Labels: { list: () => ({ labels: [] }) } } },
+        }
+      }
+      return { getResponseCode: () => status, getContentText: () => JSON.stringify(result) };
+    } },
   });
   vm.runInContext(source, context, { filename: 'Code.gs' });
   const event = (key = KEY) => ({ parameters: { key: [key] }, postData: { type: 'application/x-www-form-urlencoded;charset=UTF-8', length: 68 } });
@@ -84,6 +110,13 @@ function harness(messages = [], overrides = {}) {
     duringWrite: (hook) => { onWrite = hook; },
     duringLock: (hook) => { onLock = hook; },
     setList: (value) => { listResult = value; },
+    setExchange: (value) => { exchange = value; },
+    failRefresh: () => { refreshError = true; },
+    owner: (action, values = {}, key = 'c'.repeat(64)) => {
+      const parameters = Object.fromEntries(Object.entries({ key, action, ...values }).map(([name, value]) => [name, [value]]));
+      return JSON.parse(context.doPost({ parameters, postData: { type: 'application/x-www-form-urlencoded', length: 1000 } }).content);
+    },
+    callback: (values) => context.doGet({ parameters: Object.fromEntries(Object.entries(values).map(([name, value]) => [name, [value]])) }),
   };
 }
 
@@ -176,7 +209,7 @@ test('invalid, missing, revoked and duplicate keys never access Gmail', () => {
   delete h.props.ACCESS_KEY_family;
   assert.equal(h.check().status, 'unauthorized');
   assert.equal(h.calls.length, 0);
-  assert.equal(JSON.parse(h.api.doGet().content).status, 'unauthorized');
+  assert(!h.api.doGet().content.includes('0123'));
 });
 
 test('revocation or key rotation while acquiring lock blocks access', () => {
@@ -244,6 +277,108 @@ test('configuration, pagination and Gmail failures return sanitized errors', () 
   assert.equal(tooMany.calls.length, 0);
 });
 
+test('automatic filtering without a Gmail label; marketing ignored; latest verification fails closed', () => {
+  const marketing = mail('marketing', 'Your sign-in code: 9999', 1);
+  marketing.payload.headers[1].value = 'New shows for November';
+  const h = harness([marketing, mail('valid', 'Your sign-in code: 0123')], { NETFLIX_LABEL_ID: '', NETFLIX_SENDERS: '[]' });
+  assert.equal(h.check().otp, '0123');
+  assert.equal(h.calls[0].options.labelIds.length, 0);
+  assert.equal(harness([mail('bad', 'Get Code')], { NETFLIX_LABEL_ID: '', NETFLIX_SENDERS: '[]' }).check().status, 'unreadable');
+  assert.equal(harness([mail('spoof', 'Your sign-in code: 0123', 1, 'text/plain', 'a@evilnetflix.com')], { NETFLIX_LABEL_ID: '', NETFLIX_SENDERS: '[]' }).check().status, 'not_found');
+});
+
+test('unconnected/revoked Gmail never returns stale code or credentials', () => {
+  const empty = harness([], { MAILBOX_REFRESH_TOKEN: '' });
+  const result = empty.check();
+  assert.equal(result.status, 'not_connected');
+  validateResponse(result);
+  assert.equal(empty.calls.length, 0);
+  const revoked = harness();
+  revoked.failRefresh();
+  assert.equal(revoked.check().status, 'not_connected');
+  assert.equal(revoked.props.MAILBOX_CONNECTED, 'false');
+});
+
+const login = (h) => {
+  const state = 'd'.repeat(64), verifier = 'e'.repeat(64), nonce = 'f'.repeat(64);
+  return { state, verifier, nonce, start: () => h.owner('owner_start', { state, nonce, challenge: hash(verifier) }),
+    finish: () => h.owner('owner_finish', { state, verifier }) };
+};
+const token = (patch = {}) => ({
+  refresh_token: 'new-synthetic-refresh', access_token: 'synthetic-access',
+  scope: 'openid email https://www.googleapis.com/auth/gmail.readonly',
+  id_token: 'header.' + Buffer.from(JSON.stringify({ iss: 'https://accounts.google.com',
+    aud: 'test.apps.googleusercontent.com', exp: NOW / 1000 + 600, nonce: 'f'.repeat(64),
+    email_verified: true, email: 'synthetic@example.com', sub: 'synthetic-owner', ...patch,
+  })).toString('base64url') + '.signature',
+});
+
+test('owner secret isolated from viewer; PKCE, callback binding, one-time exchange and privacy', () => {
+  const h = harness();
+  assert.equal(h.owner('owner_status', {}, KEY).status, 'unauthorized');
+  assert.equal(h.check('c'.repeat(64)).status, 'unauthorized');
+  assert.equal(h.owner('owner_status').status, 'owner_status');
+  const flow = login(h);
+  const start = flow.start();
+  assert.equal(start.status, 'authorize');
+  const url = new URL(start.url);
+  assert.equal(url.searchParams.get('code_challenge'), Buffer.from(hash(flow.verifier), 'hex').toString('base64url'));
+  assert.equal(url.searchParams.get('redirect_uri'), h.props.BACKEND_URL);
+  assert(!start.url.includes('c'.repeat(64)));
+  assert.equal(flow.start().status, 'busy');
+  h.callback({ state: '0'.repeat(64), code: 'wrong' });
+  assert.equal(flow.finish().status, 'pending');
+  const page = h.callback({ state: flow.state, code: 'synthetic-authorization-code' });
+  assert(!page.content.includes('synthetic-authorization-code'));
+  assert.equal(h.owner('owner_finish', { state: flow.state, verifier: '0'.repeat(64) }).status, 'expired');
+  h.setExchange(token());
+  const result = flow.finish();
+  assert.equal(result.status, 'connected');
+  assert.equal(h.props.MAILBOX_REFRESH_TOKEN, 'new-synthetic-refresh');
+  assert(!JSON.stringify(result).includes('refresh'));
+  assert.equal(flow.finish().status, 'expired');
+  assert.equal(h.props.OAUTH_PENDING, undefined);
+});
+
+test('denial, expired login, rotated owner secret and simultaneous finish fail closed', () => {
+  const denied = harness();
+  const first = login(denied); first.start();
+  denied.callback({ state: first.state, error: 'access_denied' });
+  assert.equal(first.finish().status, 'denied');
+  const expired = harness(); const second = login(expired); second.start(); expired.advance(600000);
+  expired.callback({ state: second.state, code: 'late-code' });
+  assert.equal(second.finish().status, 'expired');
+  assert.equal(expired.props.OAUTH_PENDING, undefined);
+  const rotated = harness();
+  rotated.duringLock(() => { rotated.props.OWNER_SETUP_HASH = hash('0'.repeat(64)); });
+  assert.equal(rotated.owner('owner_status').status, 'unauthorized');
+  const concurrent = harness(); const third = login(concurrent); third.start();
+  concurrent.callback({ state: third.state, code: 'synthetic-code' });
+  concurrent.setExchange(token());
+  let nested;
+  concurrent.duringLock(() => { nested = third.finish(); });
+  assert.equal(third.finish().status, 'connected');
+  assert.equal(nested.status, 'busy');
+});
+
+test('Google claims, missing Gmail grant and another mailbox cannot overwrite the owner', () => {
+  for (const patch of [{ aud: 'wrong' }, { iss: 'https://evil.example' }, { exp: NOW / 1000 }, { nonce: 'wrong' }, { email_verified: false }]) {
+    const h = harness(); const flow = login(h); flow.start(); h.callback({ state: flow.state, code: 'synthetic-code' });
+    h.setExchange(token(patch));
+    assert.equal(flow.finish().status, 'error');
+    assert.equal(h.props.MAILBOX_REFRESH_TOKEN, 'synthetic-refresh');
+  }
+  for (const patch of [{ scope: 'openid email' }, { refresh_token: '' }]) {
+    const h = harness(); const flow = login(h); flow.start(); h.callback({ state: flow.state, code: 'synthetic-code' });
+    h.setExchange({ ...token(), ...patch });
+    assert.equal(flow.finish().status, 'error');
+  }
+  const h = harness([], { MAILBOX_SUB: 'existing-owner' });
+  const flow = login(h); flow.start(); h.callback({ state: flow.state, code: 'synthetic-code' }); h.setExchange(token());
+  assert.equal(flow.finish().status, 'different_mailbox');
+  assert.equal(h.props.MAILBOX_REFRESH_TOKEN, 'synthetic-refresh');
+});
+
 test('private fragment consumed once without browser storage', () => {
   let target;
   const location = { hash: `#key=${KEY}`, pathname: '/checker/', search: '?lang=vi' };
@@ -281,6 +416,15 @@ test('link generator stores only hash in deployment property; no secret printed'
     assert(!data.propertyValue.includes(key));
   } finally { unlinkSync(path); }
   assert.equal(spawnSync(process.execPath, ['scripts/create-link.mjs', '../bad', 'http://example.com']).status, 1);
+  const outputOwner = execFileSync(process.execPath, ['scripts/create-link.mjs', 'owner', 'https://example.github.io/checker/'], { encoding: 'utf8' });
+  const ownerPath = outputOwner.split(/\r?\n/)[0].replace('Đã tạo file riêng: ', '');
+  try {
+    const data = JSON.parse(readFileSync(ownerPath, 'utf8'));
+    const url = new URL(data.privateLink);
+    assert.equal(url.searchParams.get('setup'), '1');
+    assert.equal(data.propertyName, 'OWNER_SETUP_HASH');
+    assert.equal(data.propertyValue, hash(new URLSearchParams(url.hash.slice(1)).get('setup')));
+  } finally { unlinkSync(ownerPath); }
 });
 
 const originalFetch = globalThis.fetch;

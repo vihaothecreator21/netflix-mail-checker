@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { checkCode, consumeKey, validEndpoint } from './api.js';
 import './style.css';
+import { OwnerSetup } from './owner.jsx';
 
 const endpoint = (import.meta.env.VITE_APPS_SCRIPT_URL || '').trim();
 const messages = {
@@ -13,6 +14,7 @@ const messages = {
   unauthorized: 'Link không hợp lệ hoặc đã được thu hồi. Liên hệ chủ tài khoản để nhận link mới.',
   missing_key: 'Mở link riêng do chủ tài khoản cung cấp để lấy mã.',
   setup: 'Website chưa được cấu hình kết nối Gmail.',
+  not_connected: 'Chủ tài khoản chưa kết nối Gmail hoặc cần cấp quyền lại.',
   rate_limited: 'Đã đạt giới hạn kiểm tra. Vui lòng đợi trước khi thử lại.',
   error: 'Không thể kiểm tra lúc này. Kết nối Gmail hoặc hạn mức có thể đang gặp lỗi.',
   expired: 'Mã đã được ẩn sau 15 phút. Bấm nút để kiểm tra email mới.',
@@ -152,4 +154,4 @@ function App() {
   );
 }
 
-createRoot(document.getElementById('root')).render(<App />);
+createRoot(document.getElementById('root')).render(new URLSearchParams(location.search).has('setup') ? <OwnerSetup endpoint={endpoint} /> : <App />);
